@@ -1,0 +1,186 @@
+package ru.practicum.event.service;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.PageRequest;
+import org.springframework.data.domain.Pageable;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import ru.practicum.client.RecommendationsClient;
+import ru.practicum.internal.error.exception.BadRequestException;
+import ru.practicum.internal.error.exception.NotFoundException;
+import ru.practicum.internal.error.exception.RuleViolationException;
+import ru.practicum.internal.event.dto.EventFullDto;
+import ru.practicum.internal.event.dto.EventShortDto;
+import ru.practicum.internal.event.enums.EventState;
+import ru.practicum.internal.request.enums.RequestStatus;
+import ru.practicum.internal.request.client.RequestInternalClient;
+import ru.practicum.internal.user.dto.UserShortDto;
+import ru.practicum.internal.user.client.UserInternalClient;
+import ru.practicum.event.category.dto.ResponseCategoryDto;
+import ru.practicum.event.category.service.CategoryService;
+import ru.practicum.event.dao.EventRepository;
+import ru.practicum.event.dto.NewEventDto;
+import ru.practicum.event.dto.UpdateEventRequest;
+import ru.practicum.event.mapper.EventMapper;
+import ru.practicum.event.mapper.UserMapper;
+import ru.practicum.event.model.Event;
+import ru.practicum.event.service.util.EventServiceUtil;
+
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.stream.Collectors;
+
+@Service
+@RequiredArgsConstructor
+@Transactional
+@Slf4j
+public class PrivateEventServiceImpl implements PrivateEventService {
+
+    private final EventRepository eventRepository;
+    private final RecommendationsClient recommendationsClient;
+    private final UserInternalClient userInternalClient;
+    private final CategoryService categoryService;
+    private final RequestInternalClient requestInternalClient;
+    private final EventMapper eventMapper;
+    private final UserMapper userMapper;
+
+    @Override
+    public EventFullDto create(Long userId, NewEventDto newEventDto) {
+        log.info("Создание нового события пользователем с ID {}: {}", userId, newEventDto);
+
+        if (newEventDto.getEventDate().isBefore(LocalDateTime.now().plusHours(2))) {
+            throw new BadRequestException("Дата и время на которые намечено событие не может быть раньше, чем через два часа от текущего момента");
+        }
+
+        UserShortDto userShortDto = userMapper.toUserShortDto(userInternalClient.getUserById(userId));
+
+        ResponseCategoryDto categoryDto = categoryService.getCategory(newEventDto.getCategory());
+
+        Event newEvent = eventMapper.toEvent(newEventDto, userShortDto.getId(), categoryDto.getId());
+
+        newEvent = eventRepository.saveAndFlush(newEvent);
+
+        log.info("Событие c ID {} создано пользователем с ID {}.", newEvent.getId(), userId);
+
+        return eventMapper.toEventFullDto(newEvent, categoryDto, userShortDto, 0L, 0.0);
+    }
+
+    @Override
+    public EventFullDto update(Long userId, Long eventId, UpdateEventRequest updateEventRequest) {
+        log.info("Обновление события с ID {} пользователем с ID {}: {}", eventId, userId, updateEventRequest);
+
+        UserShortDto userShortDto = userMapper.toUserShortDto(userInternalClient.getUserById(userId));
+
+        Event event = eventRepository.findById(eventId)
+                .orElseThrow(() -> new NotFoundException("Событие с ID " + eventId + " не найдено"));
+
+        validateCriticalRules(event, userShortDto.getId(), updateEventRequest);
+
+        ResponseCategoryDto categoryDto = categoryService.getCategory(updateEventRequest.getCategory() != null ? updateEventRequest.getCategory() : event.getCategoryId());
+
+
+        eventMapper.updateEvent(event, updateEventRequest, userShortDto.getId());
+
+        eventRepository.saveAndFlush(event);
+
+        Long confirmedRequests = requestInternalClient.getRequestsCountsByStatusAndEventIds(RequestStatus.CONFIRMED, Set.of(eventId)).getOrDefault(eventId, 0L);
+
+        if (event.getPublishedOn() == null) {
+            return eventMapper.toEventFullDto(event, categoryDto, userShortDto, confirmedRequests, 0.0);
+        }
+
+        Double rating = EventServiceUtil.getEventRating(eventId, recommendationsClient);
+
+        log.info("Событие с ID {} обновлено пользователем с ID {}.", eventId, userId);
+
+        return eventMapper.toEventFullDto(event, categoryDto, userShortDto, confirmedRequests, rating);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public EventFullDto getById(Long userId, Long eventId) {
+        log.info("Получение события с ID {} пользователем с ID {}.", eventId, userId);
+
+        UserShortDto userShortDto = userMapper.toUserShortDto(userInternalClient.getUserById(userId));
+
+        Event event = eventRepository.findById(eventId)
+                .orElseThrow(() -> new NotFoundException("Событие с ID " + eventId + " не найдено"));
+
+        if (!Objects.equals(userShortDto.getId(), event.getInitiatorId())) {
+            log.error("Пользователь с ID {} пытается получить чужое событие с ID {}", userId, eventId);
+            throw new RuleViolationException("Пользователь с ID " + userId + " не является инициатором события c ID " + eventId);
+        }
+
+        Long confirmedRequests = requestInternalClient.getRequestsCountsByStatusAndEventIds(RequestStatus.CONFIRMED, Set.of(eventId)).getOrDefault(eventId, 0L);
+
+        ResponseCategoryDto categoryDto = categoryService.getCategory(event.getCategoryId());
+
+        if (event.getPublishedOn() == null) {
+            return eventMapper.toEventFullDto(event, categoryDto, userShortDto, confirmedRequests, 0.0);
+        }
+
+        Double rating = EventServiceUtil.getEventRating(eventId,recommendationsClient);
+
+        return eventMapper.toEventFullDto(event, categoryDto, userShortDto, confirmedRequests, rating);
+    }
+
+    @Override
+    @Transactional(readOnly = true)
+    public List<EventShortDto> getAll(Long userId, int from, int size) {
+        log.info("Получение всех событий пользователя с ID: {}, from: {}, size: {}.", userId, from, size);
+
+        UserShortDto userShortDto = userMapper.toUserShortDto(userInternalClient.getUserById(userId));
+
+        if (userShortDto == null) {
+            throw new NotFoundException("Пользователь c ID " + userId + " не найден");
+        }
+
+        Pageable pageable = PageRequest.of(from / size, size);
+        List<Event> events = eventRepository.findByInitiatorIdOrderByEventDateDesc(userId, pageable).stream().toList();
+
+        Set<Long> eventIds = events
+                .stream().map(Event::getId)
+                .collect(Collectors.toSet());
+
+        Map<Long, Long> confirmedRequests = requestInternalClient.getRequestsCountsByStatusAndEventIds(RequestStatus.CONFIRMED, eventIds);
+
+        Set<Long> categoriesIds = events.stream()
+                .map(Event::getCategoryId)
+                .collect(Collectors.toSet());
+
+        Map<Long, Double> ratings = EventServiceUtil.getEventRatings(eventIds, recommendationsClient);
+
+        Map<Long, ResponseCategoryDto> categoryDtos = EventServiceUtil.getResponseCategoryDtoMap(categoryService, categoriesIds);
+
+        return EventServiceUtil.getEventShortDtos(
+                Collections.singletonMap(userId, userShortDto),
+                categoryDtos,
+                events,
+                confirmedRequests,
+                ratings,
+                eventMapper
+        );
+    }
+
+    private static void validateCriticalRules(Event event, Long userId, UpdateEventRequest updateEventRequest) {
+        Long eventId = event.getId();
+
+        if (!Objects.equals(userId, event.getInitiatorId())) {
+            log.error("Пользователь с ID {} пытается обновить чужое событие с ID {}", userId, eventId);
+            throw new RuleViolationException("Пользователь с ID " + userId + " не является инициатором события c ID " + eventId);
+        }
+
+        if (event.getState() != EventState.PENDING && event.getState() != EventState.CANCELED) {
+            log.error("Невозможно обновить событие с ID {}: неверный статус события", eventId);
+            throw new RuleViolationException("Изменить можно только события в статусах PENDING и CANCELED");
+        }
+
+        if (updateEventRequest.getEventDate() != null &&
+                updateEventRequest.getEventDate().isBefore(LocalDateTime.now().plusHours(2))) {
+            log.error("Ошибка в дате события с ID {}: новая дата ранее двух часов от текущего момента", eventId);
+            throw new BadRequestException("Дата и время на которые намечено событие не может быть раньше, чем через два " +
+                    "часа от текущего момента");
+        }
+    }
+}

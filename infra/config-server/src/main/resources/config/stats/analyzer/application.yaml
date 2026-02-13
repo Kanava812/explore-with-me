@@ -1,0 +1,53 @@
+grpc:
+  server:
+    port: 0
+server:
+  port: 0
+
+spring:
+  datasource:
+    driver-class-name: org.postgresql.Driver
+    url: jdbc:postgresql://localhost:6541/explorewithme
+    username: explorewithme
+    password: explorewithme
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        format_sql: true
+    database-platform: org.hibernate.dialect.PostgreSQLDialect
+  sql:
+    init:
+      mode: always
+      schema-locations: classpath:schema.sql
+      platform: postgresql
+
+logging.level.org.springframework:
+  web.client.RestTemplate: DEBUG
+  orm:
+    jpa: INFO
+    jpa.JpaTransactionManager: DEBUG
+  transaction: INFO
+  transaction.interceptor: DEBUG
+
+kafka:
+  similarity-consumer:
+    properties:
+      bootstrap.servers: localhost:9092
+      group.id: analyzer-similarity
+      auto.offset.reset: earliest
+      enable.auto.commit: false
+      key.deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value.deserializer: ru.practicum.kafka.deserialization.EventSimilarityDeserializer
+    topic: stats.events-similarity.v1
+  action-consumer:
+    properties:
+      bootstrap.servers: localhost:9092
+      group.id: analyzer-actions
+      auto.offset.reset: earliest
+      enable.auto.commit: false
+      key.deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value.deserializer: ru.practicum.kafka.deserialization.UserActionDeserializer
+    topic: stats.user-actions.v1
+
